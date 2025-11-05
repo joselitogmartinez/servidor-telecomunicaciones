@@ -14,7 +14,7 @@ const client = new MongoClient(uri);
 let db, users, doors, accessLogs;
 
 // MQTT Configuration
-const MQTT_BROKER = 'mqtt://localhost:1883'; // Broker Mosquitto local
+const MQTT_BROKER = 'mqtt://127.0.0.1:1883'; // Broker Mosquitto local
 const mqttClient = mqtt.connect(MQTT_BROKER);
 
 // Topics MQTT
