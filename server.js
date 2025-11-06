@@ -3,22 +3,10 @@ const { MongoClient, ObjectId } = require('mongodb');
 const express = require('express');
 const cors = require('cors');
 const mqtt = require('mqtt');
-const http = require('http');
-const socketio = require('socket.io');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
-
-// Crear servidor HTTP y configurar Socket.IO
-const server = http.createServer(app);
-const io = socketio(server, { 
-  cors: { 
-    origin: ['http://206.189.214.35:3001', 'http://localhost:3001'],
-    methods: ['GET', 'POST'],
-    credentials: true
-  } 
-});
 
 // MongoDB Connection
 const uri = 'mongodb+srv://jgironm20:haxnJx9nctumRp3P@cluster0.ckdcpb7.mongodb.net/?appName=Cluster0';
@@ -39,59 +27,24 @@ const TOPICS = {
 // Store para manejar solicitudes pendientes
 const pendingRequests = new Map();
 
-// Configurar Socket.IO
-io.on('connection', (socket) => {
-  console.log('✅ Cliente conectado al WebSocket:', socket.id);
-  console.log('📊 Total clientes conectados:', io.engine.clientsCount);
-  
-  // Enviar estado inicial al conectarse
-  socket.emit('connection-status', { 
-    status: 'connected', 
-    timestamp: new Date().toISOString(),
-    socketId: socket.id 
-  });
-  
-  socket.on('disconnect', (reason) => {
-    console.log('❌ Cliente desconectado del WebSocket:', socket.id, 'Razón:', reason);
-    console.log('📊 Total clientes conectados:', io.engine.clientsCount);
-  });
-
-  // Manejar ping del cliente
-  socket.on('ping', () => {
-    socket.emit('pong', { timestamp: new Date().toISOString() });
-  });
-});
-
 // Configurar cliente MQTT
 mqttClient.on('connect', () => {
-  console.log('✅ Conectado al broker MQTT');
+  console.log('Conectado al broker MQTT');
   
   // Suscribirse a respuestas del ESP32
   mqttClient.subscribe(TOPICS.DOOR_OPEN_RESPONSE);
   mqttClient.subscribe(TOPICS.DOOR_SENSOR_STATUS);
-  
-  // Notificar a todos los clientes conectados
-  io.emit('mqtt-status', { status: 'connected', timestamp: new Date().toISOString() });
 });
 
 mqttClient.on('error', (error) => {
-  console.error('❌ Error MQTT:', error);
-  io.emit('mqtt-status', { status: 'error', error: error.message, timestamp: new Date().toISOString() });
-});
-
-mqttClient.on('disconnect', () => {
-  console.log('❌ Desconectado del broker MQTT');
-  io.emit('mqtt-status', { status: 'disconnected', timestamp: new Date().toISOString() });
+  console.error('Error MQTT:', error);
 });
 
 // Manejar mensajes MQTT del ESP32
 mqttClient.on('message', async (topic, message) => {
   try {
     const data = JSON.parse(message.toString());
-    console.log(`📨 Mensaje MQTT recibido en ${topic}:`, data);
-    
-    // Emitir mensaje MQTT crudo a clientes para debugging
-    io.emit('mqtt-message', { topic, data, timestamp: new Date().toISOString() });
+    console.log(`Mensaje MQTT recibido en ${topic}:`, data);
     
     if (topic === TOPICS.DOOR_OPEN_RESPONSE) {
       await handleDoorOpenResponse(data);
@@ -99,12 +52,7 @@ mqttClient.on('message', async (topic, message) => {
       await handleDoorSensorStatus(data);
     }
   } catch (error) {
-    console.error('❌ Error procesando mensaje MQTT:', error);
-    io.emit('system-error', { 
-      type: 'mqtt-parse-error', 
-      error: error.message, 
-      timestamp: new Date().toISOString() 
-    });
+    console.error('Error procesando mensaje MQTT:', error);
   }
 });
 
@@ -115,8 +63,6 @@ async function handleDoorOpenResponse(data) {
   if (pendingRequests.has(requestId)) {
     const request = pendingRequests.get(requestId);
     request.doorResponse = { success, error };
-    
-    console.log(`🚪 Respuesta de puerta para ${requestId}: success=${success}, error=${error}`);
     
     // Si la puerta no se pudo abrir, registrar inmediatamente
     if (!success) {
@@ -131,7 +77,7 @@ async function handleDoorOpenResponse(data) {
       if (request.res && !request.res.headersSent) {
         request.res.json({
           granted: false,
-          userId: request.user?._id || null,
+          userId: request.user?.id || null,
           userName: request.user?.name || null,
           reason: `Error en puerta: ${error}`,
           timestamp: new Date().toISOString()
@@ -140,8 +86,6 @@ async function handleDoorOpenResponse(data) {
       
       pendingRequests.delete(requestId);
     }
-  } else {
-    console.log(`⚠️ No se encontró solicitud pendiente para requestId: ${requestId}`);
   }
 }
 
@@ -151,8 +95,6 @@ async function handleDoorSensorStatus(data) {
   
   if (pendingRequests.has(requestId)) {
     const request = pendingRequests.get(requestId);
-    
-    console.log(`🚪 Estado del sensor para ${requestId}: doorOpened=${doorOpened}`);
     
     if (doorOpened) {
       // Puerta se abrió exitosamente
@@ -164,27 +106,17 @@ async function handleDoorSensorStatus(data) {
       });
       
       // Actualizar estado de la puerta
-      const doorUpdate = {
-        doorId: request.doorId,
-        state: 'open',
-        lastEventTs: timestamp || new Date().toISOString()
-      };
-      
       await doors.updateOne(
         { doorId: request.doorId },
-        { $set: doorUpdate },
+        { $set: { state: 'open', lastEventTs: timestamp || new Date().toISOString() } },
         { upsert: true }
       );
-      
-      // Emitir cambio de estado de puerta
-      io.emit('door-status-changed', doorUpdate);
-      console.log('📡 Evento door-status-changed emitido:', doorUpdate);
       
       // Responder al cliente
       if (request.res && !request.res.headersSent) {
         request.res.json({
           granted: true,
-          userId: request.user?._id || null,
+          userId: request.user?.id || null,
           userName: request.user?.name || null,
           reason: null,
           timestamp: timestamp || new Date().toISOString()
@@ -195,7 +127,7 @@ async function handleDoorSensorStatus(data) {
       await logAccessAttempt({
         ...request,
         granted: false,
-        reason: 'La puerta no se abrió - Timeout del sensor',
+        reason: 'La puerta no se abrió',
         status: 'error_puerta'
       });
       
@@ -203,97 +135,38 @@ async function handleDoorSensorStatus(data) {
       if (request.res && !request.res.headersSent) {
         request.res.json({
           granted: false,
-          userId: request.user?._id || null,
+          userId: request.user?.id || null,
           userName: request.user?.name || null,
-          reason: 'La puerta no se abrió - Timeout del sensor',
+          reason: 'La puerta no se abrió',
           timestamp: new Date().toISOString()
         });
       }
     }
     
     pendingRequests.delete(requestId);
-  } else {
-    console.log(`⚠️ No se encontró solicitud pendiente para requestId: ${requestId}`);
   }
 }
 
-// Función para registrar intentos de acceso con notificación WebSocket
+// Función para registrar intentos de acceso
 async function logAccessAttempt(requestData) {
   const { user, accessCode, doorId, granted, reason, status, timestamp } = requestData;
   
-  const logEntry = {
+  await accessLogs.insertOne({
     userId: user?._id || null,
     userName: user?.name || null,
     accessCode,
     doorId,
     granted,
     reason,
-    status, // 'acceso_concedido', 'usuario_inactivo', 'codigo_invalido', 'error_puerta'
+    status, // 'acceso_concedido', 'acceso_denegado', 'usuario_inactivo', 'codigo_invalido', 'error_puerta'
     timestamp: timestamp || new Date().toISOString()
-  };
-  
-  try {
-    // Guardar en base de datos
-    await accessLogs.insertOne(logEntry);
-    
-    // Emitir evento WebSocket para actualizaciones en tiempo real
-    io.emit('new-access-log', logEntry);
-    console.log('📡 Evento new-access-log emitido:', {
-      userName: logEntry.userName,
-      granted: logEntry.granted,
-      reason: logEntry.reason,
-      timestamp: logEntry.timestamp
-    });
-    
-    // Emitir estadísticas actualizadas
-    await emitUpdatedStats();
-    
-  } catch (error) {
-    console.error('❌ Error registrando acceso:', error);
-    io.emit('system-error', { 
-      type: 'log-error', 
-      error: error.message, 
-      timestamp: new Date().toISOString() 
-    });
-  }
-}
-
-// Función para emitir estadísticas actualizadas
-async function emitUpdatedStats() {
-  try {
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    
-    const totalUsers = await users.countDocuments();
-    const activeUsers = await users.countDocuments({ isActive: true });
-    const todayAccesses = await accessLogs.countDocuments({
-      timestamp: { $gte: today.toISOString() }
-    });
-    const todayGranted = await accessLogs.countDocuments({
-      timestamp: { $gte: today.toISOString() },
-      granted: true
-    });
-    
-    const stats = {
-      totalUsers,
-      activeUsers,
-      todayAccesses,
-      todayGranted,
-      todayDenied: todayAccesses - todayGranted,
-      timestamp: new Date().toISOString()
-    };
-    
-    io.emit('stats-updated', stats);
-    console.log('📊 Estadísticas actualizadas emitidas');
-  } catch (error) {
-    console.error('❌ Error calculando estadísticas:', error);
-  }
+  });
 }
 
 async function connectDB() {
   try {
     await client.connect();
-    console.log('✅ Conectado exitosamente a MongoDB Atlas');
+    console.log('Conectado exitosamente a MongoDB Atlas');
     db = client.db('usuariotelecomunicaciones');
     users = db.collection('users');
     doors = db.collection('doors');
@@ -301,45 +174,33 @@ async function connectDB() {
     
     // Crear usuarios iniciales si no existen
     await initializeData();
-    
-    // Emitir estado de DB a clientes conectados
-    io.emit('db-status', { status: 'connected', timestamp: new Date().toISOString() });
-    
   } catch (error) {
-    console.error('❌ Error conectando a MongoDB:', error);
-    io.emit('db-status', { status: 'error', error: error.message, timestamp: new Date().toISOString() });
+    console.error('Error conectando a MongoDB:', error);
     process.exit(1);
   }
 }
 
 async function initializeData() {
-  try {
-    // Verificar si ya existen usuarios
-    const userCount = await users.countDocuments();
-    if (userCount === 0) {
-      console.log('📝 Creando usuarios iniciales...');
-      await users.insertMany([
-        { name: 'Admin', accessCode: '1234', isActive: true },
-        { name: 'Usuario1', accessCode: '5678', isActive: true },
-        { name: 'Usuario2', accessCode: '9999', isActive: true }
-      ]);
-      
-      // Emitir evento de usuarios creados
-      io.emit('users-initialized', { count: 3, timestamp: new Date().toISOString() });
-    }
-    
-    // Verificar si ya existe la puerta principal
-    const doorExists = await doors.findOne({ doorId: 'Puerta Principal' });
-    if (!doorExists) {
-      console.log('🚪 Creando puerta principal...');
-      await doors.insertOne({
-        doorId: 'Puerta Principal',
-        state: 'closed',
-        lastEventTs: new Date().toISOString()
-      });
-    }
-  } catch (error) {
-    console.error('❌ Error inicializando datos:', error);
+  // Verificar si ya existen usuarios
+  const userCount = await users.countDocuments();
+  if (userCount === 0) {
+    console.log('Creando usuarios iniciales...');
+    await users.insertMany([
+      { name: 'Admin', accessCode: '1234', isActive: true },
+      { name: 'Usuario1', accessCode: '5678', isActive: true },
+      { name: 'Usuario2', accessCode: '9999', isActive: true }
+    ]);
+  }
+  
+  // Verificar si ya existe la puerta principal
+  const doorExists = await doors.findOne({ doorId: 'Puerta Principal' });
+  if (!doorExists) {
+    console.log('Creando puerta principal...');
+    await doors.insertOne({
+      doorId: 'Puerta Principal',
+      state: 'closed',
+      lastEventTs: new Date().toISOString()
+    });
   }
 }
 
@@ -349,14 +210,12 @@ app.post('/api/access/request', async (req, res) => {
     const { code, doorId = 'Puerta Principal' } = req.body;
     const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     
-    console.log(`🔐 Solicitud de acceso recibida - Código: ${code}, Puerta: ${doorId}, ID: ${requestId}`);
-    
-    // Buscar el usuario por código
+    // Primero buscar el usuario por código (sin importar si está activo o no)
     const user = await users.findOne({ accessCode: code });
     
     if (user && user.isActive) {
       // Usuario ACTIVO - Iniciar proceso MQTT
-      console.log(`✅ Usuario activo encontrado: ${user.name}`);
+      console.log(`Iniciando proceso MQTT para usuario: ${user.name}`);
       
       // Guardar solicitud pendiente
       pendingRequests.set(requestId, {
@@ -378,20 +237,12 @@ app.post('/api/access/request', async (req, res) => {
       };
       
       mqttClient.publish(TOPICS.DOOR_OPEN_REQUEST, JSON.stringify(mqttMessage));
-      console.log(`📤 Comando MQTT enviado:`, mqttMessage);
-      
-      // Emitir evento de solicitud iniciada
-      io.emit('access-request-started', {
-        requestId,
-        userName: user.name,
-        doorId,
-        timestamp: new Date().toISOString()
-      });
+      console.log(`Comando MQTT enviado:`, mqttMessage);
       
       // Timeout de 10 segundos para respuesta del ESP32
       setTimeout(async () => {
         if (pendingRequests.has(requestId)) {
-          console.log(`⏰ Timeout para solicitud ${requestId}`);
+          // No hubo respuesta del ESP32 o del sensor
           const request = pendingRequests.get(requestId);
           
           await logAccessAttempt({
@@ -417,8 +268,6 @@ app.post('/api/access/request', async (req, res) => {
       
     } else if (user && !user.isActive) {
       // Usuario INACTIVO - Acceso denegado inmediatamente
-      console.log(`❌ Usuario inactivo: ${user.name}`);
-      
       await logAccessAttempt({
         user,
         accessCode: code,
@@ -438,8 +287,6 @@ app.post('/api/access/request', async (req, res) => {
       
     } else {
       // Usuario NO encontrado - Código inválido
-      console.log(`❌ Código inválido: ${code}`);
-      
       await logAccessAttempt({
         user: null,
         accessCode: code,
@@ -458,12 +305,7 @@ app.post('/api/access/request', async (req, res) => {
       });
     }
   } catch (error) {
-    console.error('❌ Error en validación de acceso:', error);
-    io.emit('system-error', { 
-      type: 'access-validation-error', 
-      error: error.message, 
-      timestamp: new Date().toISOString() 
-    });
+    console.error('Error en validación de acceso:', error);
     res.status(500).json({ error: 'Error interno del servidor' });
   }
 });
@@ -482,20 +324,14 @@ app.post('/api/users', async (req, res) => {
     }
     
     const result = await users.insertOne({ name, accessCode, isActive });
-    const newUser = { 
-      _id: result.insertedId, 
+    res.status(201).json({ 
+      id: result.insertedId, 
       name, 
       accessCode, 
       isActive 
-    };
-    
-    // Emitir evento de nuevo usuario
-    io.emit('user-created', newUser);
-    await emitUpdatedStats();
-    
-    res.status(201).json(newUser);
+    });
   } catch (error) {
-    console.error('❌ Error creando usuario:', error);
+    console.error('Error creando usuario:', error);
     res.status(500).json({ error: 'Error interno del servidor' });
   }
 });
@@ -516,23 +352,23 @@ app.get('/api/doors/:doorId/status', async (req, res) => {
       lastEventTs: door.lastEventTs 
     });
   } catch (error) {
-    console.error('❌ Error obteniendo estado de puerta:', error);
+    console.error('Error obteniendo estado de puerta:', error);
     res.status(500).json({ error: 'Error interno del servidor' });
   }
 });
 
-// Obtener todos los usuarios
+// Obtener todos los usuarios (endpoint adicional útil)
 app.get('/api/users', async (req, res) => {
   try {
     const allUsers = await users.find({}).toArray();
     res.json(allUsers);
   } catch (error) {
-    console.error('❌ Error obteniendo usuarios:', error);
+    console.error('Error obteniendo usuarios:', error);
     res.status(500).json({ error: 'Error interno del servidor' });
   }
 });
 
-// Actualizar usuario
+// Actualizar usuario (activar/desactivar)
 app.put('/api/users/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -552,16 +388,9 @@ app.put('/api/users/:id', async (req, res) => {
       return res.status(404).json({ error: 'Usuario no encontrado' });
     }
     
-    // Obtener el usuario actualizado
-    const updatedUser = await users.findOne({ _id: new ObjectId(id) });
-    
-    // Emitir evento de usuario actualizado
-    io.emit('user-updated', updatedUser);
-    await emitUpdatedStats();
-    
     res.json({ message: 'Usuario actualizado correctamente' });
   } catch (error) {
-    console.error('❌ Error actualizando usuario:', error);
+    console.error('Error actualizando usuario:', error);
     res.status(500).json({ error: 'Error interno del servidor' });
   }
 });
@@ -570,23 +399,15 @@ app.put('/api/users/:id', async (req, res) => {
 app.delete('/api/users/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    
-    // Obtener el usuario antes de eliminarlo
-    const userToDelete = await users.findOne({ _id: new ObjectId(id) });
-    
     const result = await users.deleteOne({ _id: new ObjectId(id) });
     
     if (result.deletedCount === 0) {
       return res.status(404).json({ error: 'Usuario no encontrado' });
     }
     
-    // Emitir evento de usuario eliminado
-    io.emit('user-deleted', { _id: id, name: userToDelete?.name });
-    await emitUpdatedStats();
-    
     res.json({ message: 'Usuario eliminado correctamente' });
   } catch (error) {
-    console.error('❌ Error eliminando usuario:', error);
+    console.error('Error eliminando usuario:', error);
     res.status(500).json({ error: 'Error interno del servidor' });
   }
 });
@@ -598,98 +419,22 @@ app.get('/api/access/logs', async (req, res) => {
     const logs = await accessLogs.find({}).sort({ timestamp: -1 }).limit(parseInt(limit)).toArray();
     res.json(logs);
   } catch (error) {
-    console.error('❌ Error obteniendo logs de acceso:', error);
+    console.error('Error obteniendo logs de acceso:', error);
     res.status(500).json({ error: 'Error interno del servidor' });
   }
-});
-
-// Obtener estadísticas del sistema
-app.get('/api/stats', async (req, res) => {
-  try {
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    
-    const totalUsers = await users.countDocuments();
-    const activeUsers = await users.countDocuments({ isActive: true });
-    const todayAccesses = await accessLogs.countDocuments({
-      timestamp: { $gte: today.toISOString() }
-    });
-    const todayGranted = await accessLogs.countDocuments({
-      timestamp: { $gte: today.toISOString() },
-      granted: true
-    });
-    
-    res.json({
-      totalUsers,
-      activeUsers,
-      todayAccesses,
-      todayGranted,
-      todayDenied: todayAccesses - todayGranted
-    });
-  } catch (error) {
-    console.error('❌ Error obteniendo estadísticas:', error);
-    res.status(500).json({ error: 'Error interno del servidor' });
-  }
-});
-
-// Endpoint para probar WebSocket manualmente
-app.post('/api/test/websocket', (req, res) => {
-  const testLog = {
-    userId: null,
-    userName: 'Test User',
-    accessCode: 'TEST',
-    doorId: 'Puerta Principal',
-    granted: true,
-    reason: 'Test desde API',
-    status: 'test',
-    timestamp: new Date().toISOString()
-  };
-  
-  // Emitir evento de prueba
-  io.emit('new-access-log', testLog);
-  
-  res.json({ 
-    success: true, 
-    message: 'Evento WebSocket de prueba enviado',
-    connectedClients: io.engine.clientsCount,
-    testLog 
-  });
 });
 
 // Cerrar conexión al terminar la aplicación
 process.on('SIGINT', async () => {
-  console.log('🔄 Cerrando conexiones...');
-  
-  // Notificar a clientes que el servidor se está cerrando
-  io.emit('server-shutdown', { message: 'Servidor reiniciándose...', timestamp: new Date().toISOString() });
-  
-  // Cerrar conexiones
-  mqttClient.end();
+  console.log('Cerrando conexión a MongoDB...');
   await client.close();
-  io.close();
-  
-  console.log('✅ Conexiones cerradas correctamente');
   process.exit(0);
 });
 
 // Inicializar la base de datos y luego el servidor
 connectDB().then(() => {
   const PORT = process.env.PORT || 3000;
-  server.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Servidor escuchando en puerto ${PORT}`);
-    console.log(`🔌 WebSocket disponible en ws://206.189.214.35:${PORT}`);
-    console.log(`📡 Clientes conectados: ${io.engine.clientsCount}`);
-    
-    // Emitir estado del servidor cada 30 segundos
-    setInterval(() => {
-      io.emit('server-heartbeat', {
-        timestamp: new Date().toISOString(),
-        connectedClients: io.engine.clientsCount,
-        pendingRequests: pendingRequests.size
-      });
-    }, 30000);
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Servidor escuchando en puerto ${PORT}`);
   });
-}).catch(error => {
-  console.error('❌ Error iniciando servidor:', error);
-  process.exit(1);
 });
