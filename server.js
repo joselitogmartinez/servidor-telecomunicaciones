@@ -3,10 +3,21 @@ const { MongoClient, ObjectId } = require('mongodb');
 const express = require('express');
 const cors = require('cors');
 const mqtt = require('mqtt');
+const http = require('http');
+const socketio = require('socket.io');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Crear servidor HTTP y configurar Socket.IO
+const server = http.createServer(app);
+const io = socketio(server, { 
+  cors: { 
+    origin: '*',
+    methods: ['GET', 'POST']
+  } 
+});
 
 // MongoDB Connection
 const uri = 'mongodb+srv://jgironm20:haxnJx9nctumRp3P@cluster0.ckdcpb7.mongodb.net/?appName=Cluster0';
@@ -26,6 +37,15 @@ const TOPICS = {
 
 // Store para manejar solicitudes pendientes
 const pendingRequests = new Map();
+
+// Configurar Socket.IO
+io.on('connection', (socket) => {
+  console.log('Cliente conectado al WebSocket:', socket.id);
+  
+  socket.on('disconnect', () => {
+    console.log('Cliente desconectado del WebSocket:', socket.id);
+  });
+});
 
 // Configurar cliente MQTT
 mqttClient.on('connect', () => {
@@ -106,11 +126,20 @@ async function handleDoorSensorStatus(data) {
       });
       
       // Actualizar estado de la puerta
+      const doorUpdate = {
+        doorId: request.doorId,
+        state: 'open',
+        lastEventTs: timestamp || new Date().toISOString()
+      };
+      
       await doors.updateOne(
         { doorId: request.doorId },
-        { $set: { state: 'open', lastEventTs: timestamp || new Date().toISOString() } },
+        { $set: doorUpdate },
         { upsert: true }
       );
+      
+      // Emitir cambio de estado de puerta
+      io.emit('door-status-changed', doorUpdate);
       
       // Responder al cliente
       if (request.res && !request.res.headersSent) {
@@ -147,11 +176,11 @@ async function handleDoorSensorStatus(data) {
   }
 }
 
-// Función para registrar intentos de acceso
+// Función para registrar intentos de acceso con notificación WebSocket
 async function logAccessAttempt(requestData) {
   const { user, accessCode, doorId, granted, reason, status, timestamp } = requestData;
   
-  await accessLogs.insertOne({
+  const logEntry = {
     userId: user?._id || null,
     userName: user?.name || null,
     accessCode,
@@ -160,7 +189,14 @@ async function logAccessAttempt(requestData) {
     reason,
     status, // 'acceso_concedido', 'acceso_denegado', 'usuario_inactivo', 'codigo_invalido', 'error_puerta'
     timestamp: timestamp || new Date().toISOString()
-  });
+  };
+  
+  // Guardar en base de datos
+  await accessLogs.insertOne(logEntry);
+  
+  // Emitir evento WebSocket para actualizaciones en tiempo real
+  io.emit('new-access-log', logEntry);
+  console.log('Evento WebSocket emitido:', logEntry);
 }
 
 async function connectDB() {
@@ -424,6 +460,35 @@ app.get('/api/access/logs', async (req, res) => {
   }
 });
 
+// Obtener estadísticas del sistema
+app.get('/api/stats', async (req, res) => {
+  try {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    
+    const totalUsers = await users.countDocuments();
+    const activeUsers = await users.countDocuments({ isActive: true });
+    const todayAccesses = await accessLogs.countDocuments({
+      timestamp: { $gte: today.toISOString() }
+    });
+    const todayGranted = await accessLogs.countDocuments({
+      timestamp: { $gte: today.toISOString() },
+      granted: true
+    });
+    
+    res.json({
+      totalUsers,
+      activeUsers,
+      todayAccesses,
+      todayGranted,
+      todayDenied: todayAccesses - todayGranted
+    });
+  } catch (error) {
+    console.error('Error obteniendo estadísticas:', error);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+});
+
 // Cerrar conexión al terminar la aplicación
 process.on('SIGINT', async () => {
   console.log('Cerrando conexión a MongoDB...');
@@ -434,7 +499,8 @@ process.on('SIGINT', async () => {
 // Inicializar la base de datos y luego el servidor
 connectDB().then(() => {
   const PORT = process.env.PORT || 3000;
-  app.listen(PORT, '0.0.0.0', () => {
+  server.listen(PORT, '0.0.0.0', () => {
     console.log(`Servidor escuchando en puerto ${PORT}`);
+    console.log(`WebSocket disponible en ws://http://206.189.214.35: ${PORT}`);
   });
 });
