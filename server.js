@@ -40,24 +40,24 @@ function publish(topic, payloadObj) {
 
 // Configurar cliente MQTT
 mqttClient.on('connect', () => {
-  console.log(`Conectado al broker MQTT: ${MQTT_BROKER}`);
+  console.log(`✓ Conectado al broker MQTT: ${MQTT_BROKER}`);
 
   mqttClient.subscribe(TOPICS.DOOR_OPEN_RESPONSE, (err) => {
-    console.log('Sub DOOR_OPEN_RESPONSE', err ? `ERROR ${err.message}` : 'OK');
+    console.log('✓ Suscrito a DOOR_OPEN_RESPONSE', err ? `ERROR ${err.message}` : 'OK');
   });
 
   mqttClient.subscribe(TOPICS.DOOR_SENSOR_STATUS, (err) => {
-    console.log('Sub DOOR_SENSOR_STATUS', err ? `ERROR ${err.message}` : 'OK');
+    console.log('✓ Suscrito a DOOR_SENSOR_STATUS', err ? `ERROR ${err.message}` : 'OK');
   });
 
   mqttClient.subscribe(TOPICS.UNAUTHORIZED_ACCESS, (err) => {
-    console.log('Sub UNAUTHORIZED_ACCESS', err ? `ERROR ${err.message}` : 'OK');
+    console.log('✓ Suscrito a UNAUTHORIZED_ACCESS', err ? `ERROR ${err.message}` : 'OK');
   });
 });
 
-mqttClient.on('reconnect', () => console.log('MQTT reconectando...'));
-mqttClient.on('offline', () => console.log('MQTT offline'));
-mqttClient.on('error', (error) => console.error('Error MQTT:', error));
+mqttClient.on('reconnect', () => console.log('⚠️ MQTT reconectando...'));
+mqttClient.on('offline', () => console.log('⚠️ MQTT offline'));
+mqttClient.on('error', (error) => console.error('✗ Error MQTT:', error));
 
 mqttClient.on('message', async (topic, message) => {
   try {
@@ -72,22 +72,27 @@ mqttClient.on('message', async (topic, message) => {
       await handleUnauthorizedAccess(data);
     }
   } catch (error) {
-    console.error('Error procesando mensaje MQTT:', error);
+    console.error('✗ Error procesando mensaje MQTT:', error);
   }
 });
 
 async function handleDoorOpenResponse(data) {
   const { requestId, success, error } = data;
+  console.log(`[handleDoorOpenResponse] RequestId: ${requestId}, Success: ${success}`);
+  
   if (pendingRequests.has(requestId)) {
     const request = pendingRequests.get(requestId);
     request.doorResponse = { success, error };
+    
     if (!success) {
       await logAccessAttempt({
         ...request,
         granted: false,
         reason: `Error en puerta: ${error}`,
-        status: 'error_puerta'
+        status: 'error_puerta',
+        timestamp: new Date().toISOString()
       });
+      
       if (request.res && !request.res.headersSent) {
         request.res.json({
           granted: false,
@@ -104,24 +109,31 @@ async function handleDoorOpenResponse(data) {
 
 async function handleDoorSensorStatus(data) {
   const { requestId, doorOpened, doorClosed, timestamp, event } = data;
+  
+  console.log('[handleDoorSensorStatus] Datos recibidos:', data);
 
-  // Actualizar estado de la puerta en la base de datos
-  const doorState = doorClosed ? 'closed' : 'open';
+  // Actualizar estado de la puerta inmediatamente
+  const doorState = doorClosed ? 'closed' : (doorOpened ? 'open' : 'unknown');
+  const currentTimestamp = timestamp || new Date().toISOString();
+
   await doors.updateOne(
     { doorId: 'Puerta Principal' },
     {
       $set: {
         state: doorState,
-        lastEventTs: timestamp || new Date().toISOString(),
+        lastEventTs: currentTimestamp,
         lastEvent: event || 'status_update'
       }
     },
     { upsert: true }
   );
 
+  console.log(`✓ Estado de puerta actualizado: ${doorState} - Timestamp: ${currentTimestamp}`);
+
   // Si hay un requestId pendiente, procesarlo
   if (requestId && pendingRequests.has(requestId)) {
     const request = pendingRequests.get(requestId);
+    
     if (doorOpened) {
       await logAccessAttempt({
         user: request.user,
@@ -130,8 +142,9 @@ async function handleDoorSensorStatus(data) {
         granted: true,
         reason: request.isManual ? 'Apertura manual desde dashboard' : null,
         status: request.isManual ? 'apertura_manual' : 'acceso_concedido',
-        timestamp: timestamp || new Date().toISOString()
+        timestamp: currentTimestamp
       });
+      
       if (request.res && !request.res.headersSent) {
         request.res.json({
           success: true,
@@ -139,36 +152,18 @@ async function handleDoorSensorStatus(data) {
           userId: request.user?._id || null,
           userName: request.user?.name || null,
           manual: request.isManual || false,
-          timestamp: timestamp || new Date().toISOString()
+          timestamp: currentTimestamp
         });
       }
-    } else {
-      await logAccessAttempt({
-        user: request.user,
-        accessCode: request.accessCode,
-        doorId: request.doorId,
-        granted: false,
-        reason: 'La puerta no se abrió',
-        status: 'error_puerta',
-        timestamp: new Date().toISOString()
-      });
-      if (request.res && !request.res.headersSent) {
-        request.res.json({
-          success: false,
-          granted: false,
-          userId: request.user?._id || null,
-          userName: request.user?.name || null,
-          reason: 'La puerta no se abrió',
-          timestamp: new Date().toISOString()
-        });
-      }
+      pendingRequests.delete(requestId);
     }
-    pendingRequests.delete(requestId);
   }
 }
 
 async function handleUnauthorizedAccess(data) {
   const { timestamp, event, message, reason } = data;
+  const currentTimestamp = timestamp || new Date().toISOString();
+  
   console.log('⚠️ ALERTA: Acceso no autorizado detectado');
 
   // Registrar el intento de acceso no autorizado
@@ -180,9 +175,11 @@ async function handleUnauthorizedAccess(data) {
     granted: false,
     reason: reason || message || 'Apertura física sin autorización',
     status: 'acceso_no_autorizado',
-    timestamp: timestamp || new Date().toISOString(),
+    timestamp: currentTimestamp,
     event: event || 'unauthorized_access'
   });
+
+  console.log(`✓ Acceso no autorizado registrado con timestamp: ${currentTimestamp}`);
 
   // Actualizar estado de la puerta
   await doors.updateOne(
@@ -190,7 +187,7 @@ async function handleUnauthorizedAccess(data) {
     {
       $set: {
         state: 'open',
-        lastEventTs: timestamp || new Date().toISOString(),
+        lastEventTs: currentTimestamp,
         lastEvent: 'unauthorized_access'
       }
     },
@@ -200,7 +197,8 @@ async function handleUnauthorizedAccess(data) {
 
 async function logAccessAttempt(requestData) {
   const { user, accessCode, doorId, granted, reason, status, timestamp } = requestData;
-  await accessLogs.insertOne({
+
+  const logEntry = {
     userId: user?._id || null,
     userName: user?.name || null,
     accessCode,
@@ -209,20 +207,23 @@ async function logAccessAttempt(requestData) {
     reason,
     status,
     timestamp: timestamp || new Date().toISOString()
-  });
+  };
+
+  console.log('📝 Registrando acceso:', logEntry);
+  await accessLogs.insertOne(logEntry);
 }
 
 async function connectDB() {
   try {
     await client.connect();
-    console.log('Conectado exitosamente a MongoDB Atlas');
+    console.log('✓ Conectado exitosamente a MongoDB Atlas');
     db = client.db('usuariotelecomunicaciones');
     users = db.collection('users');
     doors = db.collection('doors');
     accessLogs = db.collection('accessLogs');
     await initializeData();
   } catch (error) {
-    console.error('Error conectando a MongoDB:', error);
+    console.error('✗ Error conectando a MongoDB:', error);
     process.exit(1);
   }
 }
@@ -249,21 +250,25 @@ async function initializeData() {
   }
 }
 
+// ==================== ENDPOINTS API ====================
+
 // Validar acceso - FLUJO MQTT COMPLETO
 app.post('/api/access/request', async (req, res) => {
   try {
     const { code, doorId = 'Puerta Principal' } = req.body;
     const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const currentTimestamp = new Date().toISOString();
     const user = await users.findOne({ accessCode: code });
 
     if (user && user.isActive) {
-      console.log(`Iniciando proceso MQTT para usuario: ${user.name}`);
+      console.log(`✓ Iniciando proceso MQTT para usuario: ${user.name}`);
+      
       pendingRequests.set(requestId, {
         user,
         accessCode: code,
         doorId,
         res,
-        timestamp: new Date().toISOString()
+        timestamp: currentTimestamp
       });
 
       publish(TOPICS.DOOR_OPEN_REQUEST, {
@@ -272,7 +277,7 @@ app.post('/api/access/request', async (req, res) => {
         doorId,
         userId: user._id.toString(),
         userName: user.name,
-        timestamp: new Date().toISOString()
+        timestamp: currentTimestamp
       });
 
       setTimeout(async () => {
@@ -282,7 +287,8 @@ app.post('/api/access/request', async (req, res) => {
             ...request,
             granted: false,
             reason: 'Timeout - No hay respuesta del sistema de puerta',
-            status: 'error_puerta'
+            status: 'error_puerta',
+            timestamp: new Date().toISOString()
           });
           if (request.res && !request.res.headersSent) {
             request.res.json({
@@ -297,6 +303,8 @@ app.post('/api/access/request', async (req, res) => {
         }
       }, 10000);
     } else if (user && !user.isActive) {
+      console.log(`⚠️ Usuario inactivo: ${user.name}`);
+      
       // Publicar como acceso no autorizado al ESP32
       publish(TOPICS.UNAUTHORIZED_ACCESS, {
         requestId,
@@ -304,7 +312,7 @@ app.post('/api/access/request', async (req, res) => {
         doorId,
         reason: 'Usuario inactivo',
         event: 'usuario_inactivo',
-        timestamp: new Date().toISOString()
+        timestamp: currentTimestamp
       });
 
       await logAccessAttempt({
@@ -313,7 +321,8 @@ app.post('/api/access/request', async (req, res) => {
         doorId,
         granted: false,
         reason: 'Usuario inactivo',
-        status: 'usuario_inactivo'
+        status: 'usuario_inactivo',
+        timestamp: currentTimestamp
       });
 
       return res.json({
@@ -321,9 +330,11 @@ app.post('/api/access/request', async (req, res) => {
         userId: user._id,
         userName: user.name,
         reason: 'Usuario inactivo',
-        timestamp: new Date().toISOString()
+        timestamp: currentTimestamp
       });
     } else {
+      console.log(`⚠️ Código de acceso inválido: ${code}`);
+      
       // Publicar como acceso no autorizado al ESP32
       publish(TOPICS.UNAUTHORIZED_ACCESS, {
         requestId,
@@ -331,7 +342,7 @@ app.post('/api/access/request', async (req, res) => {
         doorId,
         reason: 'Código de acceso inválido',
         event: 'codigo_invalido',
-        timestamp: new Date().toISOString()
+        timestamp: currentTimestamp
       });
 
       await logAccessAttempt({
@@ -340,7 +351,8 @@ app.post('/api/access/request', async (req, res) => {
         doorId,
         granted: false,
         reason: 'Código de acceso inválido',
-        status: 'codigo_invalido'
+        status: 'codigo_invalido',
+        timestamp: currentTimestamp
       });
 
       return res.json({
@@ -348,11 +360,11 @@ app.post('/api/access/request', async (req, res) => {
         userId: null,
         userName: null,
         reason: 'Código de acceso inválido',
-        timestamp: new Date().toISOString()
+        timestamp: currentTimestamp
       });
     }
   } catch (error) {
-    console.error('Error en validación de acceso:', error);
+    console.error('✗ Error en validación de acceso:', error);
     res.status(500).json({ error: 'Error interno del servidor' });
   }
 });
@@ -362,8 +374,9 @@ app.post('/api/doors/open/manual', async (req, res) => {
   try {
     const { adminName = 'Administrador', doorId = 'Puerta Principal' } = req.body;
     const requestId = `req_manual_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const currentTimestamp = new Date().toISOString();
 
-    console.log(`Solicitud manual de apertura por: ${adminName}`);
+    console.log(`✓ Solicitud manual de apertura por: ${adminName}`);
 
     // Crear solicitud pendiente
     pendingRequests.set(requestId, {
@@ -371,7 +384,7 @@ app.post('/api/doors/open/manual', async (req, res) => {
       accessCode: 'MANUAL',
       doorId,
       res,
-      timestamp: new Date().toISOString(),
+      timestamp: currentTimestamp,
       isManual: true
     });
 
@@ -383,7 +396,7 @@ app.post('/api/doors/open/manual', async (req, res) => {
       userId: 'admin',
       userName: adminName,
       manual: true,
-      timestamp: new Date().toISOString()
+      timestamp: currentTimestamp
     });
 
     // Timeout
@@ -412,7 +425,7 @@ app.post('/api/doors/open/manual', async (req, res) => {
       }
     }, 10000);
   } catch (error) {
-    console.error('Error en apertura manual:', error);
+    console.error('✗ Error en apertura manual:', error);
     res.status(500).json({ error: 'Error interno del servidor' });
   }
 });
@@ -433,7 +446,7 @@ app.get('/api/doors/status/realtime', async (req, res) => {
       isClosed: door.state === 'closed'
     });
   } catch (error) {
-    console.error('Error obteniendo estado de puerta:', error);
+    console.error('✗ Error obteniendo estado de puerta:', error);
     res.status(500).json({ error: 'Error interno del servidor' });
   }
 });
@@ -443,13 +456,26 @@ app.get('/api/access/unauthorized', async (req, res) => {
   try {
     const { limit = 20 } = req.query;
     const unauthorizedLogs = await accessLogs
-      .find({ status: 'acceso_no_autorizado' })
+      .find({
+        $or: [
+          { status: 'acceso_no_autorizado' },
+          { status: 'usuario_inactivo' },
+          { status: 'codigo_invalido' }
+        ]
+      })
       .sort({ timestamp: -1 })
       .limit(parseInt(limit))
       .toArray();
-    res.json(unauthorizedLogs);
+
+    // Asegurar que todos los logs tengan timestamps válidos
+    const logsWithValidTimestamps = unauthorizedLogs.map(log => ({
+      ...log,
+      timestamp: log.timestamp || new Date().toISOString()
+    }));
+
+    res.json(logsWithValidTimestamps);
   } catch (error) {
-    console.error('Error obteniendo accesos no autorizados:', error);
+    console.error('✗ Error obteniendo accesos no autorizados:', error);
     res.status(500).json({ error: 'Error interno del servidor' });
   }
 });
@@ -473,7 +499,7 @@ app.post('/api/users', async (req, res) => {
       isActive
     });
   } catch (error) {
-    console.error('Error creando usuario:', error);
+    console.error('✗ Error creando usuario:', error);
     res.status(500).json({ error: 'Error interno del servidor' });
   }
 });
@@ -493,7 +519,7 @@ app.get('/api/doors/:doorId/status', async (req, res) => {
       lastEvent: door.lastEvent
     });
   } catch (error) {
-    console.error('Error obteniendo estado de puerta:', error);
+    console.error('✗ Error obteniendo estado de puerta:', error);
     res.status(500).json({ error: 'Error interno del servidor' });
   }
 });
@@ -504,7 +530,7 @@ app.get('/api/users', async (req, res) => {
     const allUsers = await users.find({}).toArray();
     res.json(allUsers);
   } catch (error) {
-    console.error('Error obteniendo usuarios:', error);
+    console.error('✗ Error obteniendo usuarios:', error);
     res.status(500).json({ error: 'Error interno del servidor' });
   }
 });
@@ -527,7 +553,7 @@ app.put('/api/users/:id', async (req, res) => {
     }
     res.json({ message: 'Usuario actualizado correctamente' });
   } catch (error) {
-    console.error('Error actualizando usuario:', error);
+    console.error('✗ Error actualizando usuario:', error);
     res.status(500).json({ error: 'Error interno del servidor' });
   }
 });
@@ -542,7 +568,7 @@ app.delete('/api/users/:id', async (req, res) => {
     }
     res.json({ message: 'Usuario eliminado correctamente' });
   } catch (error) {
-    console.error('Error eliminando usuario:', error);
+    console.error('✗ Error eliminando usuario:', error);
     res.status(500).json({ error: 'Error interno del servidor' });
   }
 });
@@ -554,7 +580,7 @@ app.get('/api/access/logs', async (req, res) => {
     const logs = await accessLogs.find({}).sort({ timestamp: -1 }).limit(parseInt(limit)).toArray();
     res.json(logs);
   } catch (error) {
-    console.error('Error obteniendo logs de acceso:', error);
+    console.error('✗ Error obteniendo logs de acceso:', error);
     res.status(500).json({ error: 'Error interno del servidor' });
   }
 });
@@ -571,6 +597,8 @@ process.on('SIGINT', async () => {
 connectDB().then(() => {
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Servidor escuchando en puerto ${PORT}`);
+    console.log(`\n=== Servidor escuchando en puerto ${PORT} ===`);
+    console.log(`API disponible en: http://0.0.0.0:${PORT}/api`);
+    console.log(`MQTT Broker: ${MQTT_BROKER}\n`);
   });
 });
