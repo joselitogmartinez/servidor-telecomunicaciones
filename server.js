@@ -124,29 +124,37 @@ async function handleDoorSensorStatus(data) {
     const request = pendingRequests.get(requestId);
     if (doorOpened) {
       await logAccessAttempt({
-        ...request,
+        user: request.user,
+        accessCode: request.accessCode,
+        doorId: request.doorId,
         granted: true,
-        reason: null,
-        status: 'acceso_concedido'
+        reason: request.isManual ? 'Apertura manual desde dashboard' : null,
+        status: request.isManual ? 'apertura_manual' : 'acceso_concedido',
+        timestamp: timestamp || new Date().toISOString()
       });
       if (request.res && !request.res.headersSent) {
         request.res.json({
+          success: true,
           granted: true,
           userId: request.user?._id || null,
           userName: request.user?.name || null,
-          reason: null,
+          manual: request.isManual || false,
           timestamp: timestamp || new Date().toISOString()
         });
       }
     } else {
       await logAccessAttempt({
-        ...request,
+        user: request.user,
+        accessCode: request.accessCode,
+        doorId: request.doorId,
         granted: false,
         reason: 'La puerta no se abrió',
-        status: 'error_puerta'
+        status: 'error_puerta',
+        timestamp: new Date().toISOString()
       });
       if (request.res && !request.res.headersSent) {
         request.res.json({
+          success: false,
           granted: false,
           userId: request.user?._id || null,
           userName: request.user?.name || null,
@@ -226,7 +234,7 @@ async function initializeData() {
     await users.insertMany([
       { name: 'Admin', accessCode: '1234', isActive: true },
       { name: 'Usuario1', accessCode: '5678', isActive: true },
-      { name: 'Usuario2', accessCode: '9999', isActive: true }
+      { name: 'Usuario2', accessCode: '9999', isActive: false }
     ]);
   }
   const doorExists = await doors.findOne({ doorId: 'Puerta Principal' });
@@ -323,7 +331,6 @@ app.post('/api/access/request', async (req, res) => {
         doorId,
         reason: 'Código de acceso inválido',
         event: 'codigo_invalido',
-        accessCode: code,
         timestamp: new Date().toISOString()
       });
 
@@ -346,6 +353,103 @@ app.post('/api/access/request', async (req, res) => {
     }
   } catch (error) {
     console.error('Error en validación de acceso:', error);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+});
+
+// Endpoint para abrir puerta manualmente (administrador)
+app.post('/api/doors/open/manual', async (req, res) => {
+  try {
+    const { adminName = 'Administrador', doorId = 'Puerta Principal' } = req.body;
+    const requestId = `req_manual_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+    console.log(`Solicitud manual de apertura por: ${adminName}`);
+
+    // Crear solicitud pendiente
+    pendingRequests.set(requestId, {
+      user: { name: adminName, _id: 'admin' },
+      accessCode: 'MANUAL',
+      doorId,
+      res,
+      timestamp: new Date().toISOString(),
+      isManual: true
+    });
+
+    // Publicar solicitud de apertura
+    publish(TOPICS.DOOR_OPEN_REQUEST, {
+      requestId,
+      action: 'open_door',
+      doorId,
+      userId: 'admin',
+      userName: adminName,
+      manual: true,
+      timestamp: new Date().toISOString()
+    });
+
+    // Timeout
+    setTimeout(async () => {
+      if (pendingRequests.has(requestId)) {
+        const request = pendingRequests.get(requestId);
+        await accessLogs.insertOne({
+          userId: 'admin',
+          userName: adminName,
+          accessCode: 'MANUAL',
+          doorId,
+          granted: false,
+          reason: 'Timeout - No hay respuesta del sistema de puerta',
+          status: 'error_puerta',
+          timestamp: new Date().toISOString()
+        });
+        if (request.res && !request.res.headersSent) {
+          request.res.json({
+            success: false,
+            granted: false,
+            reason: 'Timeout - No hay respuesta del sistema de puerta',
+            timestamp: new Date().toISOString()
+          });
+        }
+        pendingRequests.delete(requestId);
+      }
+    }, 10000);
+  } catch (error) {
+    console.error('Error en apertura manual:', error);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+});
+
+// Endpoint para obtener estado de la puerta en tiempo real
+app.get('/api/doors/status/realtime', async (req, res) => {
+  try {
+    const door = await doors.findOne({ doorId: 'Puerta Principal' });
+    if (!door) {
+      return res.status(404).json({ error: 'Puerta no encontrada' });
+    }
+    res.json({
+      doorId: door.doorId,
+      state: door.state,
+      lastEventTs: door.lastEventTs,
+      lastEvent: door.lastEvent || 'unknown',
+      isOpen: door.state === 'open',
+      isClosed: door.state === 'closed'
+    });
+  } catch (error) {
+    console.error('Error obteniendo estado de puerta:', error);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+});
+
+// Endpoint para obtener accesos no autorizados recientes
+app.get('/api/access/unauthorized', async (req, res) => {
+  try {
+    const { limit = 20 } = req.query;
+    const unauthorizedLogs = await accessLogs
+      .find({ status: 'acceso_no_autorizado' })
+      .sort({ timestamp: -1 })
+      .limit(parseInt(limit))
+      .toArray();
+    res.json(unauthorizedLogs);
+  } catch (error) {
+    console.error('Error obteniendo accesos no autorizados:', error);
     res.status(500).json({ error: 'Error interno del servidor' });
   }
 });
