@@ -1,3 +1,4 @@
+// server.js
 const { MongoClient, ObjectId } = require('mongodb');
 const express = require('express');
 const cors = require('cors');
@@ -12,8 +13,8 @@ const uri = 'mongodb+srv://jgironm20:haxnJx9nctumRp3P@cluster0.ckdcpb7.mongodb.n
 const client = new MongoClient(uri);
 let db, users, doors, accessLogs;
 
-// MQTT Configuration
-const MQTT_BROKER = 'mqtt://127.0.0.1:1883'; // Broker Mosquitto local
+// MQTT Configuration (usar IP pública de la VPS)
+const MQTT_BROKER = 'mqtt://206.189.214.35:1883';
 const mqttClient = mqtt.connect(MQTT_BROKER);
 
 // Topics MQTT
@@ -27,21 +28,34 @@ const TOPICS = {
 // Store para manejar solicitudes pendientes
 const pendingRequests = new Map();
 
+// Helper publish con trazas
+function publish(topic, payloadObj) {
+  const payload = JSON.stringify(payloadObj);
+  console.log(`[MQTT->publish] ${topic} ${payload}`);
+  mqttClient.publish(topic, payload, { qos: 0, retain: false }, (err) => {
+    if (err) console.error(`[MQTT publish ERROR] ${topic}:`, err);
+  });
+}
+
 // Configurar cliente MQTT
 mqttClient.on('connect', () => {
-  console.log('Conectado al broker MQTT');
-  mqttClient.subscribe(TOPICS.DOOR_OPEN_RESPONSE);
-  mqttClient.subscribe(TOPICS.DOOR_SENSOR_STATUS);
+  console.log(`Conectado al broker MQTT: ${MQTT_BROKER}`);
+  mqttClient.subscribe(TOPICS.DOOR_OPEN_RESPONSE, (err) => {
+    console.log('Sub DOOR_OPEN_RESPONSE', err ? `ERROR ${err.message}` : 'OK');
+  });
+  mqttClient.subscribe(TOPICS.DOOR_SENSOR_STATUS, (err) => {
+    console.log('Sub DOOR_SENSOR_STATUS', err ? `ERROR ${err.message}` : 'OK');
+  });
 });
 
-mqttClient.on('error', (error) => {
-  console.error('Error MQTT:', error);
-});
+mqttClient.on('reconnect', () => console.log('MQTT reconectando...'));
+mqttClient.on('offline', () => console.log('MQTT offline'));
+mqttClient.on('error', (error) => console.error('Error MQTT:', error));
 
 mqttClient.on('message', async (topic, message) => {
   try {
     const data = JSON.parse(message.toString());
-    console.log(`Mensaje MQTT recibido en ${topic}:`, data);
+    console.log(`[MQTT<-message] ${topic}:`, data);
     if (topic === TOPICS.DOOR_OPEN_RESPONSE) {
       await handleDoorOpenResponse(data);
     } else if (topic === TOPICS.DOOR_SENSOR_STATUS) {
@@ -182,7 +196,6 @@ app.post('/api/access/request', async (req, res) => {
     const user = await users.findOne({ accessCode: code });
 
     if (user && user.isActive) {
-      // Usuario ACTIVO - Iniciar proceso MQTT
       console.log(`Iniciando proceso MQTT para usuario: ${user.name}`);
       pendingRequests.set(requestId, {
         user,
@@ -191,16 +204,15 @@ app.post('/api/access/request', async (req, res) => {
         res,
         timestamp: new Date().toISOString()
       });
-      const mqttMessage = {
+
+      publish(TOPICS.DOOR_OPEN_REQUEST, {
         requestId,
         action: 'open_door',
         doorId,
         userId: user._id.toString(),
         userName: user.name,
         timestamp: new Date().toISOString()
-      };
-      mqttClient.publish(TOPICS.DOOR_OPEN_REQUEST, JSON.stringify(mqttMessage));
-      console.log(`Comando MQTT enviado:`, mqttMessage);
+      });
 
       setTimeout(async () => {
         if (pendingRequests.has(requestId)) {
@@ -224,14 +236,13 @@ app.post('/api/access/request', async (req, res) => {
         }
       }, 10000);
     } else if (user && !user.isActive) {
-      // Usuario INACTIVO - Acceso denegado inmediatamente
-      const mqttMessage = {
+      publish(TOPICS.DOOR_DENIED, {
         requestId,
         action: 'deny_access',
         doorId,
-        reason: 'Usuario inactivo'
-      };
-      mqttClient.publish(TOPICS.DOOR_DENIED, JSON.stringify(mqttMessage));
+        reason: 'Usuario inactivo',
+        timestamp: new Date().toISOString()
+      });
       await logAccessAttempt({
         user,
         accessCode: code,
@@ -248,14 +259,13 @@ app.post('/api/access/request', async (req, res) => {
         timestamp: new Date().toISOString()
       });
     } else {
-      // Usuario NO encontrado - Código inválido
-      const mqttMessage = {
+      publish(TOPICS.DOOR_DENIED, {
         requestId,
         action: 'deny_access',
         doorId,
-        reason: 'Código de acceso inválido'
-      };
-      mqttClient.publish(TOPICS.DOOR_DENIED, JSON.stringify(mqttMessage));
+        reason: 'Código de acceso inválido',
+        timestamp: new Date().toISOString()
+      });
       await logAccessAttempt({
         user: null,
         accessCode: code,
@@ -290,11 +300,11 @@ app.post('/api/users', async (req, res) => {
       return res.status(409).json({ error: 'Código ya en uso' });
     }
     const result = await users.insertOne({ name, accessCode, isActive });
-    res.status(201).json({ 
-      id: result.insertedId, 
-      name, 
-      accessCode, 
-      isActive 
+    res.status(201).json({
+      id: result.insertedId,
+      name,
+      accessCode,
+      isActive
     });
   } catch (error) {
     console.error('Error creando usuario:', error);
@@ -310,10 +320,10 @@ app.get('/api/doors/:doorId/status', async (req, res) => {
     if (!door) {
       return res.status(404).json({ error: 'Puerta no encontrada' });
     }
-    res.json({ 
-      doorId, 
-      state: door.state, 
-      lastEventTs: door.lastEventTs 
+    res.json({
+      doorId,
+      state: door.state,
+      lastEventTs: door.lastEventTs
     });
   } catch (error) {
     console.error('Error obteniendo estado de puerta:', error);
