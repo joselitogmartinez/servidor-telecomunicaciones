@@ -13,7 +13,7 @@ const uri = 'mongodb+srv://jgironm20:haxnJx9nctumRp3P@cluster0.ckdcpb7.mongodb.n
 const client = new MongoClient(uri);
 let db, users, doors, accessLogs;
 
-// MQTT Configuration (usar IP pública de la VPS)
+// MQTT Configuration
 const MQTT_BROKER = 'mqtt://206.189.214.35:1883';
 const mqttClient = mqtt.connect(MQTT_BROKER);
 
@@ -22,7 +22,8 @@ const TOPICS = {
   DOOR_OPEN_REQUEST: 'access/door/open/request',
   DOOR_OPEN_RESPONSE: 'access/door/open/response',
   DOOR_SENSOR_STATUS: 'access/door/sensor/status',
-  DOOR_DENIED: 'access/door/denied'
+  DOOR_DENIED: 'access/door/denied',
+  UNAUTHORIZED_ACCESS: 'access/door/unauthorized'
 };
 
 // Store para manejar solicitudes pendientes
@@ -40,11 +41,17 @@ function publish(topic, payloadObj) {
 // Configurar cliente MQTT
 mqttClient.on('connect', () => {
   console.log(`Conectado al broker MQTT: ${MQTT_BROKER}`);
+
   mqttClient.subscribe(TOPICS.DOOR_OPEN_RESPONSE, (err) => {
     console.log('Sub DOOR_OPEN_RESPONSE', err ? `ERROR ${err.message}` : 'OK');
   });
+
   mqttClient.subscribe(TOPICS.DOOR_SENSOR_STATUS, (err) => {
     console.log('Sub DOOR_SENSOR_STATUS', err ? `ERROR ${err.message}` : 'OK');
+  });
+
+  mqttClient.subscribe(TOPICS.UNAUTHORIZED_ACCESS, (err) => {
+    console.log('Sub UNAUTHORIZED_ACCESS', err ? `ERROR ${err.message}` : 'OK');
   });
 });
 
@@ -56,10 +63,13 @@ mqttClient.on('message', async (topic, message) => {
   try {
     const data = JSON.parse(message.toString());
     console.log(`[MQTT<-message] ${topic}:`, data);
+
     if (topic === TOPICS.DOOR_OPEN_RESPONSE) {
       await handleDoorOpenResponse(data);
     } else if (topic === TOPICS.DOOR_SENSOR_STATUS) {
       await handleDoorSensorStatus(data);
+    } else if (topic === TOPICS.UNAUTHORIZED_ACCESS) {
+      await handleUnauthorizedAccess(data);
     }
   } catch (error) {
     console.error('Error procesando mensaje MQTT:', error);
@@ -81,7 +91,7 @@ async function handleDoorOpenResponse(data) {
       if (request.res && !request.res.headersSent) {
         request.res.json({
           granted: false,
-          userId: request.user?.id || null,
+          userId: request.user?._id || null,
           userName: request.user?.name || null,
           reason: `Error en puerta: ${error}`,
           timestamp: new Date().toISOString()
@@ -93,8 +103,24 @@ async function handleDoorOpenResponse(data) {
 }
 
 async function handleDoorSensorStatus(data) {
-  const { requestId, doorOpened, timestamp } = data;
-  if (pendingRequests.has(requestId)) {
+  const { requestId, doorOpened, doorClosed, timestamp, event } = data;
+
+  // Actualizar estado de la puerta en la base de datos
+  const doorState = doorClosed ? 'closed' : 'open';
+  await doors.updateOne(
+    { doorId: 'Puerta Principal' },
+    {
+      $set: {
+        state: doorState,
+        lastEventTs: timestamp || new Date().toISOString(),
+        lastEvent: event || 'status_update'
+      }
+    },
+    { upsert: true }
+  );
+
+  // Si hay un requestId pendiente, procesarlo
+  if (requestId && pendingRequests.has(requestId)) {
     const request = pendingRequests.get(requestId);
     if (doorOpened) {
       await logAccessAttempt({
@@ -103,15 +129,10 @@ async function handleDoorSensorStatus(data) {
         reason: null,
         status: 'acceso_concedido'
       });
-      await doors.updateOne(
-        { doorId: request.doorId },
-        { $set: { state: 'open', lastEventTs: timestamp || new Date().toISOString() } },
-        { upsert: true }
-      );
       if (request.res && !request.res.headersSent) {
         request.res.json({
           granted: true,
-          userId: request.user?.id || null,
+          userId: request.user?._id || null,
           userName: request.user?.name || null,
           reason: null,
           timestamp: timestamp || new Date().toISOString()
@@ -127,7 +148,7 @@ async function handleDoorSensorStatus(data) {
       if (request.res && !request.res.headersSent) {
         request.res.json({
           granted: false,
-          userId: request.user?.id || null,
+          userId: request.user?._id || null,
           userName: request.user?.name || null,
           reason: 'La puerta no se abrió',
           timestamp: new Date().toISOString()
@@ -136,6 +157,37 @@ async function handleDoorSensorStatus(data) {
     }
     pendingRequests.delete(requestId);
   }
+}
+
+async function handleUnauthorizedAccess(data) {
+  const { timestamp, event, message, reason } = data;
+  console.log('⚠️ ALERTA: Acceso no autorizado detectado');
+
+  // Registrar el intento de acceso no autorizado
+  await accessLogs.insertOne({
+    userId: null,
+    userName: null,
+    accessCode: null,
+    doorId: 'Puerta Principal',
+    granted: false,
+    reason: reason || message || 'Apertura física sin autorización',
+    status: 'acceso_no_autorizado',
+    timestamp: timestamp || new Date().toISOString(),
+    event: event || 'unauthorized_access'
+  });
+
+  // Actualizar estado de la puerta
+  await doors.updateOne(
+    { doorId: 'Puerta Principal' },
+    {
+      $set: {
+        state: 'open',
+        lastEventTs: timestamp || new Date().toISOString(),
+        lastEvent: 'unauthorized_access'
+      }
+    },
+    { upsert: true }
+  );
 }
 
 async function logAccessAttempt(requestData) {
@@ -183,7 +235,8 @@ async function initializeData() {
     await doors.insertOne({
       doorId: 'Puerta Principal',
       state: 'closed',
-      lastEventTs: new Date().toISOString()
+      lastEventTs: new Date().toISOString(),
+      lastEvent: 'initialized'
     });
   }
 }
@@ -236,13 +289,16 @@ app.post('/api/access/request', async (req, res) => {
         }
       }, 10000);
     } else if (user && !user.isActive) {
-      publish(TOPICS.DOOR_DENIED, {
+      // Publicar como acceso no autorizado al ESP32
+      publish(TOPICS.UNAUTHORIZED_ACCESS, {
         requestId,
-        action: 'deny_access',
+        action: 'unauthorized_access',
         doorId,
         reason: 'Usuario inactivo',
+        event: 'usuario_inactivo',
         timestamp: new Date().toISOString()
       });
+
       await logAccessAttempt({
         user,
         accessCode: code,
@@ -251,6 +307,7 @@ app.post('/api/access/request', async (req, res) => {
         reason: 'Usuario inactivo',
         status: 'usuario_inactivo'
       });
+
       return res.json({
         granted: false,
         userId: user._id,
@@ -259,13 +316,17 @@ app.post('/api/access/request', async (req, res) => {
         timestamp: new Date().toISOString()
       });
     } else {
-      publish(TOPICS.DOOR_DENIED, {
+      // Publicar como acceso no autorizado al ESP32
+      publish(TOPICS.UNAUTHORIZED_ACCESS, {
         requestId,
-        action: 'deny_access',
+        action: 'unauthorized_access',
         doorId,
         reason: 'Código de acceso inválido',
+        event: 'codigo_invalido',
+        accessCode: code,
         timestamp: new Date().toISOString()
       });
+
       await logAccessAttempt({
         user: null,
         accessCode: code,
@@ -274,6 +335,7 @@ app.post('/api/access/request', async (req, res) => {
         reason: 'Código de acceso inválido',
         status: 'codigo_invalido'
       });
+
       return res.json({
         granted: false,
         userId: null,
@@ -323,7 +385,8 @@ app.get('/api/doors/:doorId/status', async (req, res) => {
     res.json({
       doorId,
       state: door.state,
-      lastEventTs: door.lastEventTs
+      lastEventTs: door.lastEventTs,
+      lastEvent: door.lastEvent
     });
   } catch (error) {
     console.error('Error obteniendo estado de puerta:', error);
@@ -395,6 +458,7 @@ app.get('/api/access/logs', async (req, res) => {
 // Cerrar conexión al terminar la aplicación
 process.on('SIGINT', async () => {
   console.log('Cerrando conexión a MongoDB...');
+  mqttClient.end();
   await client.close();
   process.exit(0);
 });
