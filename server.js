@@ -43,7 +43,7 @@ function getServerTimestamp() {
 // Helper para crear hash de log (evitar duplicados)
 function createLogHash(logEntry) {
   const { userId, accessCode, doorId, granted, status } = logEntry;
-  const baseTime = Math.floor(Date.now() / 1000); // Segundos
+  const baseTime = Math.floor(Date.now() / 1000);
   return `${userId}-${accessCode}-${doorId}-${granted}-${status}-${baseTime}`;
 }
 
@@ -66,6 +66,10 @@ mqttClient.on('connect', () => {
 
   mqttClient.subscribe(TOPICS.DOOR_SENSOR_STATUS, (err) => {
     console.log('Sub DOOR_SENSOR_STATUS', err ? `ERROR ${err.message}` : '✓');
+  });
+
+  mqttClient.subscribe(TOPICS.DOOR_DENIED, (err) => {
+    console.log('Sub DOOR_DENIED', err ? `ERROR ${err.message}` : '✓');
   });
 
   mqttClient.subscribe(TOPICS.UNAUTHORIZED_ACCESS, (err) => {
@@ -135,7 +139,6 @@ async function handleDoorSensorStatus(data) {
     event
   });
 
-  // Determinar estado solo si hay cambio explícito
   let doorState = null;
   if (doorClosed === true) {
     doorState = 'closed';
@@ -143,10 +146,8 @@ async function handleDoorSensorStatus(data) {
     doorState = 'open';
   }
 
-  // Usar timestamp del servidor
   const serverTimestamp = getServerTimestamp();
 
-  // Actualizar BD solo si hay cambio de estado confirmado
   if (doorState !== null) {
     await doors.updateOne(
       { doorId: DOOR_ID },
@@ -162,12 +163,10 @@ async function handleDoorSensorStatus(data) {
     console.log(`✓ Estado actualizado: ${doorState.toUpperCase()} - ${serverTimestamp}`);
   }
 
-  // Procesar requestId pendiente SOLO si hubo apertura exitosa
   if (requestId && pendingRequests.has(requestId)) {
     const request = pendingRequests.get(requestId);
 
     if (doorOpened === true) {
-      // Apertura exitosa - registrar UNA SOLA VEZ
       await logAccessAttempt({
         user: request.user,
         accessCode: request.accessCode,
@@ -190,7 +189,6 @@ async function handleDoorSensorStatus(data) {
       pendingRequests.delete(requestId);
 
     } else if (doorClosed === true && !doorOpened) {
-      // Puerta no se abrió
       await logAccessAttempt({
         user: request.user,
         accessCode: request.accessCode,
@@ -212,7 +210,6 @@ async function handleDoorSensorStatus(data) {
     }
   }
 
-  // Detectar puerta dejada abierta (sin requestId)
   if (!requestId && doorOpened === true && event === 'door_opened') {
     console.log('⚠️ ALERTA: Puerta abierta sin autorización');
     await handleUnauthorizedAccess({
@@ -229,18 +226,17 @@ async function handleUnauthorizedAccess(data) {
 
   console.log('⚠️ Acceso no autorizado:', reason || message);
 
-  // Registrar intento no autorizado UNA SOLA VEZ
-  await logAccessAttempt({
-    user: null,
-    accessCode: null,
-    doorId: DOOR_ID,
-    granted: false,
-    reason: reason || message || 'Apertura física sin autorización',
-    status: 'acceso_no_autorizado'
-  });
-
-  // Solo actualizar estado si es apertura física real
+  // SOLO registrar si es apertura física real (NO códigos inválidos/usuarios inactivos)
   if (event === 'door_left_open' || (message && message.includes('físicamente'))) {
+    await logAccessAttempt({
+      user: null,
+      accessCode: null,
+      doorId: DOOR_ID,
+      granted: false,
+      reason: reason || message || 'Apertura física sin autorización',
+      status: 'acceso_no_autorizado'
+    });
+
     await doors.updateOne(
       { doorId: DOOR_ID },
       {
@@ -267,10 +263,9 @@ async function logAccessAttempt(requestData) {
     granted,
     reason,
     status,
-    timestamp: getServerTimestamp() // Usar timestamp del servidor
+    timestamp: getServerTimestamp()
   };
 
-  // Evitar duplicados usando hash temporal (1 segundo de ventana)
   const logHash = createLogHash(logEntry);
   
   if (recentLogs.has(logHash)) {
@@ -279,7 +274,7 @@ async function logAccessAttempt(requestData) {
   }
 
   recentLogs.add(logHash);
-  setTimeout(() => recentLogs.delete(logHash), 2000); // Limpiar después de 2s
+  setTimeout(() => recentLogs.delete(logHash), 2000);
 
   console.log('📝 Registrando acceso:', logEntry);
   await accessLogs.insertOne(logEntry);
@@ -301,7 +296,6 @@ async function connectDB() {
 }
 
 async function initializeData() {
-  // Crear usuarios por defecto
   const userCount = await users.countDocuments();
   if (userCount === 0) {
     console.log('Creando usuarios iniciales...');
@@ -312,7 +306,6 @@ async function initializeData() {
     ]);
   }
 
-  // IMPORTANTE: Limpiar puertas con nombres incorrectos
   console.log('🧹 Limpiando puertas duplicadas...');
   await doors.deleteMany({ doorId: { $ne: DOOR_ID } });
 
@@ -330,7 +323,7 @@ async function initializeData() {
   }
 }
 
-// Validar acceso
+// Validar acceso - CORREGIDO PARA EVITAR DUPLICADOS
 app.post('/api/access/request', async (req, res) => {
   try {
     const { code, doorId = DOOR_ID } = req.body;
@@ -381,18 +374,22 @@ app.post('/api/access/request', async (req, res) => {
       }, 10000);
 
     } else {
-      const reason = user ? 'Usuario inactivo' : 'Código inválido';
+      // Usuario inactivo o código inválido
+      const reason = user ? 'Usuario inactivo' : 'Código de acceso inválido';
       console.log(`✗ Acceso denegado: ${reason}`);
 
-      publish(TOPICS.UNAUTHORIZED_ACCESS, {
-        action: 'unauthorized_access',
+      // Publicar a DOOR_DENIED (NO a UNAUTHORIZED_ACCESS)
+      publish(TOPICS.DOOR_DENIED, {
+        action: 'access_denied',
         doorId,
         reason,
+        accessCode: code,
+        userName: user?.name || 'Desconocido',
         event: user ? 'usuario_inactivo' : 'codigo_invalido',
         timestamp: getServerTimestamp()
       });
 
-      // Registrar UNA SOLA VEZ
+      // REGISTRAR UNA SOLA VEZ AQUÍ
       await logAccessAttempt({
         user,
         accessCode: code,
@@ -493,13 +490,13 @@ app.get('/api/doors/status/realtime', async (req, res) => {
   }
 });
 
-// Historial de accesos - ORDENADO DEL MÁS RECIENTE AL MÁS ANTIGUO
+// Historial de accesos
 app.get('/api/access/logs', async (req, res) => {
   try {
     const { limit = 50 } = req.query;
     const logs = await accessLogs
       .find({})
-      .sort({ timestamp: -1 }) // -1 = descendente (más reciente primero)
+      .sort({ timestamp: -1 })
       .limit(parseInt(limit))
       .toArray();
     res.json(logs);
@@ -509,7 +506,7 @@ app.get('/api/access/logs', async (req, res) => {
   }
 });
 
-// Accesos no autorizados - ORDENADO DEL MÁS RECIENTE AL MÁS ANTIGUO
+// Accesos no autorizados
 app.get('/api/access/unauthorized', async (req, res) => {
   try {
     const { limit = 20 } = req.query;
